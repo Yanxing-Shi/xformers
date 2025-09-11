@@ -14,7 +14,6 @@
 
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_fwd_setting.h"
-#include "ck_tiled_fmha_fwd_specific_config.h"
 #include "ck_tiled_fmha_params.h"
 #include "ck_tiled_headdim_switch.h"
 
@@ -31,6 +30,12 @@ struct batched_infer_mask_bias_dropout_dispatch {
 
   using FmhaShape = typename FmhaFwdShape<MaxK, MTile>::Type;
 #if defined(FMHA_BUILD_ON_GFX950)
+  // seq_len runtime threshold for switching fmha_fwd_v3 and qr_async_tr_load
+  // pipeline use fmha_fwd_v3 pipeline if seqlen exceeds this threshold,
+  // otherwise use qr_async_tr_load. Note: this number need to be modified if we
+  // want to get better performance
+  static constexpr int switch_seqlen_threshold = 16000;
+
   using FmhaV3Shape = typename FmhaFwdSpecificShapeForV3::shape;
   using FmhaQRAsyncTrloadShape =
       typename FmhaFwdSpecificShapeForQRAsyncTrload::shape;
@@ -126,114 +131,6 @@ struct batched_infer_mask_bias_dropout_dispatch {
         (!kHasBias && (param.K % 8 == 0) && (param.Kv % 8 == 0) &&
          (MaxK <= 128 && MTile == 128));
 
-#if defined(FMHA_BUILD_ON_GFX950)
-    // Check whether BatchedForwardParams is in specific setting configs for
-    // using fmha_fwd_v3_pipeline or qr_async_trload_pipeline
-    // If True, use fmha_fwd_v3_pipeline or qr_async_trload_pipeline
-    // This is the hack part, which needs to be modified later if we want to get
-    // better performance
-
-    bool use_fmha_fwd_v3_pipeline = false;
-    bool use_qr_async_trload_pipeline = false;
-    if constexpr (std::is_same_v<ScalarType, ck_tile::bf16_t>) {
-      for (const auto& cfg : g_fmha_fwd_v3_pipeline_bf16_specific_configs) {
-        if (cfg.B == param.B && cfg.M == param.M && cfg.N == param.N &&
-            cfg.Hq == param.Hq && cfg.Hkv == param.Hkv && cfg.K == param.K &&
-            cfg.Kv == param.Kv && cfg.kHasMask == kHasMask) {
-          use_fmha_fwd_v3_pipeline = true;
-          break;
-        }
-      }
-      for (const auto& cfg : g_qr_async_tr_load_pipeline_bf16_configs) {
-        if (cfg.B == param.B && cfg.M == param.M && cfg.N == param.N &&
-            cfg.Hq == param.Hq && cfg.Hkv == param.Hkv && cfg.K == param.K &&
-            cfg.Kv == param.Kv) {
-          use_qr_async_trload_pipeline = true;
-          break;
-        }
-      }
-    } else if constexpr (std::is_same_v<ScalarType, ck_tile::fp16_t>) {
-      // We don't have fp16 specific configs for fmha_fwd_v3_pipeline or
-      // qr_async_trload_pipeline now
-    } else {
-      throw std::runtime_error("ScalarType is not supported!");
-    }
-
-#endif
-
-#if defined(FMHA_BUILD_ON_GFX950)
-    // Give priority to using fmha_fwd_v3_pipeline, then
-    // qr_async_trload_pipeline
-    if (use_fmha_fwd_v3_pipeline) {
-      if constexpr (MaxK == 128) {
-        using FmhaTraits = ck_tile::TileFmhaFwdV3Traits<
-            false, // kPadSeqLenQ,
-            false, // kPadSeqLenK,
-            false, // kPadHeadDimQ,
-            false, // kPadHeadDimV,
-            false, // kStoreLSE
-            occupancy>;
-
-        using FmhaPipelineProblem =
-            FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMask>;
-
-        using FmhaPipeline =
-            ck_tile::BlockFmhaFwdV3Pipeline<FmhaPipelineProblem>;
-
-        using FmhaEpilogue =
-            ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
-                typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
-                typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                true, // kPadM
-                true, // kPadM
-                true // UseRawStore
-                >>;
-
-        using FmhaKernel = ck_tile::FmhaFwdV3Kernel<FmhaPipeline, FmhaEpilogue>;
-
-        RunWithKernelForV3<FmhaKernel>(param, stream);
-        // skip the following pipeline if fmha_fwd_v3_pipeline is used
-        return;
-      }
-    } else if (use_qr_async_trload_pipeline) {
-      if constexpr (MaxK == 128) {
-        using FmhaTraits = ck_tile::TileFmhaTraits<
-            false, // kPadSeqLenQ,
-            false, // kPadSeqLenK,
-            false, // kPadHeadDimQ,
-            false, // kPadHeadDimV,
-            false, // kHasLogitsSoftCap
-            kBiasEnum,
-            false, // kHasBiasGrad place-holder
-            false, // kStoreLSE
-            kHasDropout,
-            false, // kDoFp8StaticQuant place-holder
-            occupancy>;
-
-        using FmhaPipelineProblem =
-            FmhaPipelineProblemQRAsyncTrloadTemp<FmhaTraits, FmhaMask>;
-
-        using FmhaPipeline =
-            ck_tile::BlockFmhaPipelineQRKSVSAsyncTrload<FmhaPipelineProblem>;
-
-        using FmhaEpilogue =
-            ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
-                typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
-                typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                true,
-                true>>;
-
-        using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
-
-        RunWithKernel<FmhaKernel>(param, stream);
-        // skip the following pipeline if qr_async_trload_pipeline is used
-        return;
-      }
-    } else {
-      // Do nothing, go to the following pipeline selection
-    }
-#endif
-
     if (!use_async_pipeline) {
       BOOL_SWITCH_3(
           pad_seqlen_k,
@@ -291,6 +188,85 @@ struct batched_infer_mask_bias_dropout_dispatch {
             }
           });
     } else {
+#if defined(FMHA_BUILD_ON_GFX950)
+      // use fmha_fwd_v3 pipeline
+      if (param.M > switch_seqlen_threshold) {
+        if constexpr (MaxK == 128 && !kHasMask) {
+          using FmhaTraits = ck_tile::TileFmhaFwdV3Traits<
+              false, // kPadSeqLenQ,
+              false, // kPadSeqLenK,
+              false, // kPadHeadDimQ,
+              false, // kPadHeadDimV,
+              false, // kStoreLSE
+              occupancy>;
+
+          using FmhaPipelineProblem =
+              FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMask>;
+
+          using FmhaPipeline =
+              ck_tile::BlockFmhaFwdV3Pipeline<FmhaPipelineProblem>;
+
+          using FmhaEpilogue =
+              ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+                  typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
+                  typename FmhaFwdTypeConfig<ScalarType>::ODataType,
+                  true, // kPadM
+                  true, // kPadM
+                  true // UseRawStore
+                  >>;
+
+          using FmhaKernel =
+              ck_tile::FmhaFwdV3Kernel<FmhaPipeline, FmhaEpilogue>;
+
+          RunWithKernelForV3<FmhaKernel>(param, stream);
+          // skip the following pipeline if fmha_fwd_v3_pipeline is used
+          return;
+        } else {
+          // do nothing, no needs to compile.
+        }
+      } else {
+        // use qr_async_trload pipeline
+        if constexpr (MaxK == 128) {
+          using FmhaTraits = ck_tile::TileFmhaTraits<
+              false, // kPadSeqLenQ,
+              false, // kPadSeqLenK,
+              false, // kPadHeadDimQ,
+              false, // kPadHeadDimV,
+              false, // kHasLogitsSoftCap
+              kBiasEnum,
+              false, // kHasBiasGrad place-holder
+              false, // kStoreLSE
+              kHasDropout,
+              false, // kDoFp8StaticQuant place-holder
+              occupancy>;
+
+          using FmhaPipelineProblem =
+              FmhaPipelineProblemQRAsyncTrloadTemp<FmhaTraits, FmhaMask>;
+
+          using FmhaPipeline =
+              ck_tile::BlockFmhaPipelineQRKSVSAsyncTrload<FmhaPipelineProblem>;
+
+          using FmhaEpilogue =
+              ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+                  typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
+                  typename FmhaFwdTypeConfig<ScalarType>::ODataType,
+                  true,
+                  true>>;
+
+          using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
+
+          RunWithKernel<FmhaKernel>(param, stream);
+          // skip the following pipeline if qr_async_trload_pipeline is used
+          return;
+        } else {
+          // do nothing, no needs to compile.
+        }
+      }
+      else {
+        // do nothing, go to the following pipeline.
+      }
+#endif
+
       BOOL_SWITCH(pad_seqlen_k, kPadSeqLenK, [&] {
         if constexpr (MaxK <= 128 && MTile == 128) {
           using FmhaTraits = ck_tile::TileFmhaTraits<
