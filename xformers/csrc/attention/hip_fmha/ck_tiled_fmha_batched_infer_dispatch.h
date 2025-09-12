@@ -31,10 +31,11 @@ struct batched_infer_mask_bias_dropout_dispatch {
   using FmhaShape = typename FmhaFwdShape<MaxK, MTile>::Type;
 #if defined(FMHA_BUILD_ON_GFX950)
   // seq_len runtime threshold for switching fmha_fwd_v3 and qr_async_tr_load
-  // pipeline use fmha_fwd_v3 pipeline if seqlen exceeds this threshold,
-  // otherwise use qr_async_tr_load. Note: this number need to be modified if we
-  // want to get better performance
-  static constexpr int switch_seqlen_threshold = 16000;
+  // pipeline on gfx950. 
+  // use fmha_fwd_v3 pipeline if seqlen exceeds this threshold, otherwise use 
+  // qr_async_tr_load pipeline.
+  // Note: this number need to be tuned if we want to get better performance
+  static constexpr int switch_seqlen_threshold = 2000;
 
   using FmhaV3Shape = typename FmhaFwdSpecificShapeForV3::shape;
   using FmhaQRAsyncTrloadShape =
@@ -190,8 +191,8 @@ struct batched_infer_mask_bias_dropout_dispatch {
     } else {
 #if defined(FMHA_BUILD_ON_GFX950)
       // use fmha_fwd_v3 pipeline
-      if (param.M > switch_seqlen_threshold) {
-        if constexpr (MaxK == 128 && !kHasMask) {
+      if (param.M > switch_seqlen_threshold && param.K == 128 && param.Kv == 128 && param.window_size <= 0) {
+        if constexpr (MaxK == 128) {
           using FmhaTraits = ck_tile::TileFmhaFwdV3Traits<
               false, // kPadSeqLenQ,
               false, // kPadSeqLenK,
@@ -200,8 +201,10 @@ struct batched_infer_mask_bias_dropout_dispatch {
               false, // kStoreLSE
               occupancy>;
 
+	  using FmhaMaskForV3 = ck_tile::GenericAttentionMask<kHasMask, /*IsLocal*/false>;
+          
           using FmhaPipelineProblem =
-              FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMask>;
+              FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMaskForV3>;
 
           using FmhaPipeline =
               ck_tile::BlockFmhaFwdV3Pipeline<FmhaPipelineProblem>;
@@ -210,22 +213,21 @@ struct batched_infer_mask_bias_dropout_dispatch {
               ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
                   typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
                   typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                  true, // kPadM
-                  true, // kPadM
-                  true // UseRawStore
+                  false, //kPadM
+                  false  //kPadN
                   >>;
 
           using FmhaKernel =
               ck_tile::FmhaFwdV3Kernel<FmhaPipeline, FmhaEpilogue>;
 
           RunWithKernelForV3<FmhaKernel>(param, stream);
-          // skip the following pipeline if fmha_fwd_v3_pipeline is used
-          return;
+	  return;
         } else {
           // do nothing, no needs to compile.
-        }
+        };
       } else {
         // use qr_async_trload pipeline
+	if (param.K == 128 && param.Kv == 128){
         if constexpr (MaxK == 128) {
           using FmhaTraits = ck_tile::TileFmhaTraits<
               false, // kPadSeqLenQ,
@@ -250,25 +252,26 @@ struct batched_infer_mask_bias_dropout_dispatch {
               ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
                   typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
                   typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                  true,
-                  true>>;
+                  false, // kPadM
+                  false  // kPadN
+		  >>;
 
           using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
 
           RunWithKernel<FmhaKernel>(param, stream);
-          // skip the following pipeline if qr_async_trload_pipeline is used
-          return;
+	  return;
         } else {
           // do nothing, no needs to compile.
-        }
-      }
-      else {
-        // do nothing, go to the following pipeline.
-      }
+        };
+	} else {
+	 // do nothing
+	}
+      };
 #endif
-
+   
       BOOL_SWITCH(pad_seqlen_k, kPadSeqLenK, [&] {
         if constexpr (MaxK <= 128 && MTile == 128) {
+           std::cout<< "async pipeline" << std::endl;
           using FmhaTraits = ck_tile::TileFmhaTraits<
               true, // kPadSeqLenQ,
               kPadSeqLenK,
