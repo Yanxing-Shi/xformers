@@ -32,8 +32,6 @@ struct batched_infer_mask_bias_dropout_dispatch {
 #if defined(FMHA_BUILD_ON_GFX950)
   // seq_len runtime threshold for switching fmha_fwd_v3 and qr_async_tr_load
   // pipeline on gfx950. 
-  // use fmha_fwd_v3 pipeline if seqlen exceeds this threshold, otherwise use 
-  // qr_async_tr_load pipeline.
   // Note: this number need to be tuned if we want to get better performance
   static constexpr int switch_seqlen_threshold = 2000;
 
@@ -190,121 +188,106 @@ struct batched_infer_mask_bias_dropout_dispatch {
           });
     } else {
 #if defined(FMHA_BUILD_ON_GFX950)
-      // use fmha_fwd_v3 pipeline
-      if (param.M > switch_seqlen_threshold && param.K == 128 && param.Kv == 128 && param.window_size <= 0) {
-        if constexpr (MaxK == 128) {
-          using FmhaTraits = ck_tile::TileFmhaFwdV3Traits<
-              false, // kPadSeqLenQ,
-              false, // kPadSeqLenK,
-              false, // kPadHeadDimQ,
-              false, // kPadHeadDimV,
-              false, // kStoreLSE
-              occupancy>;
-
-	  using FmhaMaskForV3 = ck_tile::GenericAttentionMask<kHasMask, /*IsLocal*/false>;
-          
-          using FmhaPipelineProblem =
-              FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMaskForV3>;
-
-          using FmhaPipeline =
-              ck_tile::BlockFmhaFwdV3Pipeline<FmhaPipelineProblem>;
-
-          using FmhaEpilogue =
-              ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
-                  typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
-                  typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                  false, //kPadM
-                  false  //kPadN
-                  >>;
-
-          using FmhaKernel =
-              ck_tile::FmhaFwdV3Kernel<FmhaPipeline, FmhaEpilogue>;
-
-          RunWithKernelForV3<FmhaKernel>(param, stream);
-	  return;
+    // only use fmha_fwd_v3 and qr_async_trload pipeline with hdim=128
+    if (param.K == 128 && param.Kv == 128) {
+        // use fmha_fwd_v3 pipeline if seqlen > switch_seqlen_threshold and mask type is 0(no_mask) or 2(bottom-right casual mask)
+        if (param.M > switch_seqlen_threshold && (param.custom_mask_type == 0 || param.custom_mask_type == 2)) {
+            if constexpr (MaxK == 128) {
+                using FmhaTraits = ck_tile::TileFmhaFwdV3Traits<
+                    false, // kPadSeqLenQ
+                    false, // kPadSeqLenK
+                    false, // kPadHeadDimQ
+                    false, // kPadHeadDimV
+                    false, // kStoreLSE
+                    occupancy>;
+                using FmhaMaskForV3 = ck_tile::GenericAttentionMask<kHasMask, false>;
+                using FmhaPipelineProblem = FmhaPipelineProblemV3Temp<FmhaTraits, FmhaMaskForV3>;
+                using FmhaPipeline = ck_tile::BlockFmhaFwdV3Pipeline<FmhaPipelineProblem>;
+                using FmhaEpilogue = ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+                    typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
+                    typename FmhaFwdTypeConfig<ScalarType>::ODataType,
+                    false, false>>;
+                using FmhaKernel = ck_tile::FmhaFwdV3Kernel<FmhaPipeline, FmhaEpilogue>;
+                RunWithKernelForV3<FmhaKernel>(param, stream);
+                // skip the following pipeline if use fmha_fwd_v3 pipeline
+                return;
+            } else{
+              // do nothing, no needs to compile
+            };
         } else {
-          // do nothing, no needs to compile.
+          // use qr_async_trload pipeline if seqlen <= switch_seqlen_threshold
+          if constexpr (MaxK == 128) {
+            using FmhaTraits = ck_tile::TileFmhaTraits<
+                false, // kPadSeqLenQ,
+                false, // kPadSeqLenK,
+                false, // kPadHeadDimQ,
+                false, // kPadHeadDimV,
+                false, // kHasLogitsSoftCap
+                kBiasEnum,
+                false, // kHasBiasGrad place-holder 
+                false, // kStoreLSE
+                kHasDropout,
+                false, // kDoFp8StaticQuant place-holder
+                occupancy>;
+            using FmhaPipelineProblem =
+                FmhaPipelineProblemQRAsyncTrloadTemp<FmhaTraits, FmhaMask>;
+            using FmhaPipeline = ck_tile::BlockFmhaPipelineQRKSVSAsyncTrload<
+                FmhaPipelineProblem>;
+            using FmhaEpilogue =
+                ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+                    typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
+                    typename FmhaFwdTypeConfig<ScalarType>::ODataType,
+                    false,
+                    false>>;
+            using FmhaKernel =
+                ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
+            RunWithKernel<FmhaKernel>(param, stream);
+            return;
+          } else {
+            // do nothing, no needs to compile
+          };
         };
-      } else {
-        // use qr_async_trload pipeline
-	if (param.K == 128 && param.Kv == 128){
-        if constexpr (MaxK == 128) {
-          using FmhaTraits = ck_tile::TileFmhaTraits<
-              false, // kPadSeqLenQ,
-              false, // kPadSeqLenK,
-              false, // kPadHeadDimQ,
-              false, // kPadHeadDimV,
-              false, // kHasLogitsSoftCap
-              kBiasEnum,
-              false, // kHasBiasGrad place-holder
-              false, // kStoreLSE
-              kHasDropout,
-              false, // kDoFp8StaticQuant place-holder
-              occupancy>;
-
-          using FmhaPipelineProblem =
-              FmhaPipelineProblemQRAsyncTrloadTemp<FmhaTraits, FmhaMask>;
-
-          using FmhaPipeline =
-              ck_tile::BlockFmhaPipelineQRKSVSAsyncTrload<FmhaPipelineProblem>;
-
-          using FmhaEpilogue =
-              ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
-                  typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
-                  typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                  false, // kPadM
-                  false  // kPadN
-		  >>;
-
-          using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
-
-          RunWithKernel<FmhaKernel>(param, stream);
-	  return;
-        } else {
-          // do nothing, no needs to compile.
-        };
-	} else {
-	 // do nothing
-	}
-      };
+    } else {
+      // do nothing, go to the following pipeline selection
+    };
 #endif
-   
-      BOOL_SWITCH(pad_seqlen_k, kPadSeqLenK, [&] {
-        if constexpr (MaxK <= 128 && MTile == 128) {
-           std::cout<< "async pipeline" << std::endl;
-          using FmhaTraits = ck_tile::TileFmhaTraits<
-              true, // kPadSeqLenQ,
-              kPadSeqLenK,
-              true, // kPadHeadDimQ,
-              true, // kPadHeadDimV,
-              false, // kHasLogitsSoftCap
-              kBiasEnum,
-              false, // kHasBiasGrad place-holder
-              false, // kStoreLSE
-              kHasDropout,
-              false, // kDoFp8StaticQuant place-holder
-              occupancy>;
 
-          using FmhaPipelineProblem =
-              FmhaPipelineProblemTemp<FmhaTraits, FmhaMask>;
+    BOOL_SWITCH(pad_seqlen_k, kPadSeqLenK, [&] {
+      if constexpr (MaxK <= 128 && MTile == 128) {
+        std::cout << "async pipeline" << std::endl;
+        using FmhaTraits = ck_tile::TileFmhaTraits<
+            true, // kPadSeqLenQ,
+            kPadSeqLenK,
+            true, // kPadHeadDimQ,
+            true, // kPadHeadDimV,
+            false, // kHasLogitsSoftCap
+            kBiasEnum,
+            false, // kHasBiasGrad place-holder
+            false, // kStoreLSE
+            kHasDropout,
+            false, // kDoFp8StaticQuant place-holder
+            occupancy>;
 
-          using FmhaPipeline =
-              ck_tile::BlockFmhaPipelineQRKSVSAsync<FmhaPipelineProblem>;
+        using FmhaPipelineProblem =
+            FmhaPipelineProblemTemp<FmhaTraits, FmhaMask>;
 
-          using FmhaEpilogue =
-              ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
-                  typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
-                  typename FmhaFwdTypeConfig<ScalarType>::ODataType,
-                  true,
-                  true>>;
+        using FmhaPipeline =
+            ck_tile::BlockFmhaPipelineQRKSVSAsync<FmhaPipelineProblem>;
 
-          using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
+        using FmhaEpilogue =
+            ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
+                typename FmhaFwdTypeConfig<ScalarType>::OaccDataType,
+                typename FmhaFwdTypeConfig<ScalarType>::ODataType,
+                true,
+                true>>;
 
-          RunWithKernel<FmhaKernel>(param, stream);
-        } else {
-          /* runtime will never get here, so no codes to compile */
-        };
-      });
+        using FmhaKernel = ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
+
+        RunWithKernel<FmhaKernel>(param, stream);
+      } else {
+        /* runtime will never get here, so no codes to compile */
+      };
+    });
     };
   };
 
